@@ -6,10 +6,56 @@ end
 --// Variables \\--
 local BridgeURL = getgenv().BridgeURL or ... or "localhost:16384"
 
+--// Libraries \\--
+-- Lua 5.1+ base64 v3.0 (c) 2009 by Alex Kloss <alexthkloss@web.de>
+-- licensed under the terms of the LGPL2
+
+-- character table string
+local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+-- encoding
+function base64_encode(data)
+    return ((data:gsub('.', function(x) 
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b:sub(c+1,c+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+
 --// Functions \\--
 local LuaEncode = loadstring(game:HttpGet("https://raw.githubusercontent.com/chadhyatt/LuaEncode/refs/heads/master/src/LuaEncode.lua"))()
 local cloneref = cloneref or function(x) return x end
-local decompile = decompile or function(x) return "-- Unable to get script content." end
+local decompile = decompile or function(scriptPath: Script | ModuleScript | LocalScript): string
+    local okBytecode: boolean, bytecode: string = pcall(getscriptbytecode, scriptPath)
+
+    if not okBytecode then
+        return `-- Failed to get script bytecode, error:\n\n--[[\n{bytecode}\n--]]`
+    end
+
+    local okRequest: boolean, httpResult = pcall(request, {
+        Url = "https://medal.upio.dev/decompile",
+        Method = "POST",
+        Body = base64_encode(bytecode),
+        Headers = {
+            ["Content-Type"] = "text/plain"
+        },
+    })
+
+    if not okRequest then
+        return `-- Failed to decompile, error:\n\n--[[\n{httpResult}\n--]]`
+    end
+
+    if httpResult.StatusCode ~= 200 then
+        return `-- Error occurred while requesting the API, error:\n\n--[[\n{httpResult.Body}\n--]]`
+    end
+
+    return string.gsub(httpResult.Body, string.char(0x00CD), " ")
+end
 local getnilinstances = getnilinstances or function() return {} end
 local getscriptbytecode = getscriptbytecode or function(x) error("Unable to get script bytecode.") end
 
