@@ -402,12 +402,13 @@ local function GetScriptByDebugId(debugId)
     end
 
     for _, script in getnilinstances() do
-        if script:IsA("LuaSourceContainer") and not script:IsA("Script") and script.RunContext == Enum.RunContext.Client then
-            if script:GetDebugId() ~= debugId then continue end
-            
-            ScriptInstanceMap[debugId] = script
-            return script
-        end
+        if not script:IsA("LuaSourceContainer") then continue end
+
+        if script:IsA("Script") and script.RunContext ~= Enum.RunContext.Client then continue end
+        if script:GetDebugId() ~= debugId then continue end
+        
+        ScriptInstanceMap[debugId] = script
+        return script
     end
 
     return nil
