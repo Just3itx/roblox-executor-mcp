@@ -1633,7 +1633,7 @@ server.registerTool(
         .optional(),
       scriptPath: z
         .string()
-        .describe("The path to the script to get the content of")
+        .describe("The path to the script to get the content of. If passing a GC'd script proxy (e.g. <ScriptProxy: 1_316566>), use the literal angle brackets < > — do NOT HTML-encode them as &lt; or &gt;.")
         .optional(),
       clientId: clientIdSchema,
     }),
@@ -1661,12 +1661,16 @@ server.registerTool(
       };
     }
 
-    const toolCallId = SendArbitraryDataToClient("get-script-content", {
-      source:
-        scriptGetterSource === undefined
-          ? `return ${scriptPath}`
-          : scriptGetterSource,
-    }, undefined, clientId);
+    const scriptProxyMatch = (scriptPath ?? scriptGetterSource ?? "").match(/^<ScriptProxy: (.+)>$/);
+
+    const toolCallId = SendArbitraryDataToClient("get-script-content", scriptProxyMatch
+      ? { debugId: scriptProxyMatch[1] }
+      : {
+          source:
+            scriptGetterSource === undefined
+              ? `return ${scriptPath}`
+              : scriptGetterSource,
+        }, undefined, clientId);
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;

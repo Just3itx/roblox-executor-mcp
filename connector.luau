@@ -605,6 +605,13 @@ while true do
     end)
 
     Bridge:BindToType("get-script-content", function(data)
+        --// Handle GC'd script proxies: debugId is passed directly, skip loadstring \\--
+        if data.debugId then
+            local cached = ScriptSourcesMap[data.debugId]
+            assert(cached, "No cached source found for GC'd ScriptProxy with DebugId: " .. tostring(data.debugId))
+            return cached
+        end
+
         local scriptInstance = loadstring(data.source)()
         setthreadidentity(8)
 
