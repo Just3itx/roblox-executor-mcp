@@ -14,6 +14,15 @@ const HTTP_POLL_TIMEOUT = 10000; // 10 seconds
 const PROMOTION_JITTER_MAX = 300; // ms
 const TOOL_RESPONSE_TIMEOUT = 15000; // 15 seconds
 
+// ─── CLI argument parsing ────────────────────────────────────────────────────────
+const args = process.argv.slice(2);
+const baseUrlIdx = args.indexOf("--baseurl");
+const BASE_URL: string | null = baseUrlIdx !== -1 ? (args[baseUrlIdx + 1] ?? null) : null;
+
+if (BASE_URL) {
+  console.error(`[Config] --baseurl specified: ${BASE_URL} (will run as secondary relay to this host)`);
+}
+
 // ─── Instance role ──────────────────────────────────────────────────────────────
 let instanceRole: "primary" | "secondary" = "primary";
 
@@ -1393,18 +1402,30 @@ function handleRobloxResponse(data: any) {
 
 // ─── Secondary mode ─────────────────────────────────────────────────────────────
 
-function startAsSecondary(): void {
+/**
+ * Start this instance as a secondary relay.
+ * @param relayUrl  Full WebSocket URL to connect to (e.g. "ws://host:16384/mcp-relay").
+ *                  Defaults to localhost when called from the EADDRINUSE fallback path.
+ * @param onFailed  Optional callback invoked when the initial connection attempt fails
+ *                  (used by --baseurl path to fall back to primary instead of promoting).
+ */
+function startAsSecondary(
+  relayUrl: string = `ws://localhost:${WS_PORT}/mcp-relay`,
+  onFailed?: () => void
+): void {
   instanceRole = "secondary";
   secondaryResponseResolvers = new Map();
 
-  console.error(
-    `[Secondary] Port ${WS_PORT} in use. Connecting to primary via relay...`
-  );
+  console.error(`[Secondary] Connecting to primary relay at ${relayUrl} ...`);
 
-  relaySocket = new WebSocket(`ws://localhost:${WS_PORT}/mcp-relay`);
+  relaySocket = new WebSocket(relayUrl);
+
+  // Track whether we successfully opened at least once
+  let everConnected = false;
 
   relaySocket.on("open", () => {
-    console.error("[Secondary] Connected to primary via /mcp-relay.");
+    everConnected = true;
+    console.error("[Secondary] Connected to primary via relay.");
   });
 
   relaySocket.on("message", (rawData) => {
@@ -1420,18 +1441,25 @@ function startAsSecondary(): void {
   });
 
   relaySocket.on("close", () => {
-    console.error("[Secondary] Lost connection to primary. Attempting promotion...");
     relaySocket = null;
     // Reject all pending resolvers so tool calls don't hang forever
     for (const [id, resolver] of secondaryResponseResolvers.entries()) {
       resolver({ id, output: undefined });
     }
     secondaryResponseResolvers.clear();
-    tryPromote();
+
+    if (!everConnected && onFailed) {
+      console.error("[Secondary] Never connected — remote unreachable. Falling back to primary mode.");
+      onFailed();
+    } else if (everConnected) {
+      console.error("[Secondary] Lost connection to primary. Attempting promotion...");
+      tryPromote();
+    }
   });
 
   relaySocket.on("error", (err) => {
     console.error("[Secondary] Relay socket error:", err.message);
+    // "error" is always followed by "close", so we handle fallback there.
   });
 }
 
@@ -1457,6 +1485,32 @@ function tryPromote() {
 }
 
 async function boot() {
+  // ── --baseurl path: try to connect as secondary to remote; fall back to primary ──
+  if (BASE_URL) {
+    const relayUrl = BASE_URL.replace(/\/$/, "") + "/mcp-relay";
+    console.error(`[Boot] --baseurl mode: targeting relay at ${relayUrl}`);
+
+    startAsSecondary(relayUrl, async () => {
+      // The remote was unreachable — start as primary instead
+      console.error("[Boot] Remote unreachable — starting as primary (fallback).");
+      try {
+        await startAsPrimary();
+        console.error("[Boot] Primary started successfully (fallback from --baseurl).");
+      } catch (err: any) {
+        if (err?.code === "EADDRINUSE") {
+          // A local primary is already running; become its secondary
+          console.error("[Boot] Port in use locally too — becoming secondary to localhost.");
+          startAsSecondary();
+        } else {
+          console.error("[Boot] Fatal error during fallback primary start:", err);
+          process.exit(1);
+        }
+      }
+    });
+    return;
+  }
+
+  // ── Normal path: try primary, fall back to localhost secondary ──
   try {
     await startAsPrimary();
   } catch (err: any) {
@@ -1666,11 +1720,11 @@ server.registerTool(
     const toolCallId = SendArbitraryDataToClient("get-script-content", scriptProxyMatch
       ? { debugId: scriptProxyMatch[1] }
       : {
-          source:
-            scriptGetterSource === undefined
-              ? `return ${scriptPath}`
-              : scriptGetterSource,
-        }, undefined, clientId);
+        source:
+          scriptGetterSource === undefined
+            ? `return ${scriptPath}`
+            : scriptGetterSource,
+      }, undefined, clientId);
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
@@ -1680,8 +1734,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -1741,8 +1795,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -1805,8 +1859,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -1888,8 +1942,8 @@ COMBINING SELECTORS: Chain selectors for AND logic. Example: Part.Tagged[Anchore
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -1966,8 +2020,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -2016,8 +2070,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -2088,8 +2142,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -2142,8 +2196,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
@@ -2226,8 +2280,8 @@ server.registerTool(
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
       | {
-          output: string;
-        }
+        output: string;
+      }
       | undefined;
 
     if (response === undefined || response.output === undefined) {
