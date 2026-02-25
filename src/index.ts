@@ -8,11 +8,22 @@ import { createServer, IncomingMessage, ServerResponse } from "http";
 import { z } from "zod";
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
+import path from "path";
 
 const WS_PORT = 16384;
 const HTTP_POLL_TIMEOUT = 10000; // 10 seconds
 const PROMOTION_JITTER_MAX = 300; // ms
 const TOOL_RESPONSE_TIMEOUT = 15000; // 15 seconds
+
+// ─── CLI argument parsing ────────────────────────────────────────────────────────
+const args = process.argv.slice(2);
+const baseUrlIdx = args.indexOf("--baseurl");
+const BASE_URL: string | null = baseUrlIdx !== -1 ? (args[baseUrlIdx + 1] ?? null) : null;
+
+if (BASE_URL) {
+  console.error(`[Config] --baseurl specified: ${BASE_URL} (will run as secondary relay to this host)`);
+}
 
 // ─── Instance role ──────────────────────────────────────────────────────────────
 let instanceRole: "primary" | "secondary" = "primary";
@@ -1231,6 +1242,48 @@ function startAsPrimary(): Promise<void> {
           return;
         }
 
+        // ── Screenshot API (used by secondary relay) ──
+        if (url.pathname === "/api/screenshot" && req.method === "POST") {
+          let body = "";
+          req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+          req.on("end", () => {
+            try {
+              if (process.platform !== "win32") {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Screenshots are only supported on Windows." }));
+                return;
+              }
+              const params = body ? JSON.parse(body) : {};
+              const pid: number | undefined = params.pid;
+              const result = performScreenshot(pid);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(result));
+            } catch (err: any) {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: `Screenshot failed: ${err.message || err}` }));
+            }
+          });
+          return;
+        }
+
+        // ── Windows list API (used by secondary relay) ──
+        if (url.pathname === "/api/windows" && req.method === "GET") {
+          try {
+            if (process.platform !== "win32") {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Window enumeration is only supported on Windows." }));
+              return;
+            }
+            const windows = enumRobloxWindows();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ windows }));
+          } catch (err: any) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `Window enumeration failed: ${err.message || err}` }));
+          }
+          return;
+        }
+
         res.writeHead(200);
         res.end("MCP Server Running");
       }
@@ -1393,18 +1446,30 @@ function handleRobloxResponse(data: any) {
 
 // ─── Secondary mode ─────────────────────────────────────────────────────────────
 
-function startAsSecondary(): void {
+/**
+ * Start this instance as a secondary relay.
+ * @param relayUrl  Full WebSocket URL to connect to (e.g. "ws://host:16384/mcp-relay").
+ *                  Defaults to localhost when called from the EADDRINUSE fallback path.
+ * @param onFailed  Optional callback invoked when the initial connection attempt fails
+ *                  (used by --baseurl path to fall back to primary instead of promoting).
+ */
+function startAsSecondary(
+  relayUrl: string = `ws://localhost:${WS_PORT}/mcp-relay`,
+  onFailed?: () => void
+): void {
   instanceRole = "secondary";
   secondaryResponseResolvers = new Map();
 
-  console.error(
-    `[Secondary] Port ${WS_PORT} in use. Connecting to primary via relay...`
-  );
+  console.error(`[Secondary] Connecting to primary relay at ${relayUrl} ...`);
 
-  relaySocket = new WebSocket(`ws://localhost:${WS_PORT}/mcp-relay`);
+  relaySocket = new WebSocket(relayUrl);
+
+  // Track whether we successfully opened at least once
+  let everConnected = false;
 
   relaySocket.on("open", () => {
-    console.error("[Secondary] Connected to primary via /mcp-relay.");
+    everConnected = true;
+    console.error("[Secondary] Connected to primary via relay.");
   });
 
   relaySocket.on("message", (rawData) => {
@@ -1420,18 +1485,25 @@ function startAsSecondary(): void {
   });
 
   relaySocket.on("close", () => {
-    console.error("[Secondary] Lost connection to primary. Attempting promotion...");
     relaySocket = null;
     // Reject all pending resolvers so tool calls don't hang forever
     for (const [id, resolver] of secondaryResponseResolvers.entries()) {
       resolver({ id, output: undefined });
     }
     secondaryResponseResolvers.clear();
-    tryPromote();
+
+    if (!everConnected && onFailed) {
+      console.error("[Secondary] Never connected — remote unreachable. Falling back to primary mode.");
+      onFailed();
+    } else if (everConnected) {
+      console.error("[Secondary] Lost connection to primary. Attempting promotion...");
+      tryPromote();
+    }
   });
 
   relaySocket.on("error", (err) => {
     console.error("[Secondary] Relay socket error:", err.message);
+    // "error" is always followed by "close", so we handle fallback there.
   });
 }
 
@@ -1457,6 +1529,32 @@ function tryPromote() {
 }
 
 async function boot() {
+  // ── --baseurl path: try to connect as secondary to remote; fall back to primary ──
+  if (BASE_URL) {
+    const relayUrl = BASE_URL.replace(/\/$/, "") + "/mcp-relay";
+    console.error(`[Boot] --baseurl mode: targeting relay at ${relayUrl}`);
+
+    startAsSecondary(relayUrl, async () => {
+      // The remote was unreachable — start as primary instead
+      console.error("[Boot] Remote unreachable — starting as primary (fallback).");
+      try {
+        await startAsPrimary();
+        console.error("[Boot] Primary started successfully (fallback from --baseurl).");
+      } catch (err: any) {
+        if (err?.code === "EADDRINUSE") {
+          // A local primary is already running; become its secondary
+          console.error("[Boot] Port in use locally too — becoming secondary to localhost.");
+          startAsSecondary();
+        } else {
+          console.error("[Boot] Fatal error during fallback primary start:", err);
+          process.exit(1);
+        }
+      }
+    });
+    return;
+  }
+
+  // ── Normal path: try primary, fall back to localhost secondary ──
   try {
     await startAsPrimary();
   } catch (err: any) {
@@ -1477,6 +1575,196 @@ const clientIdSchema = z
     "Target a specific Roblox client by its clientId. Use the list-clients tool to discover connected clients. If omitted, the most recently active client is used."
   )
   .optional();
+
+// ─── Screenshot helpers (Windows-only, uses PowerShell + GDI PrintWindow) ───────
+
+interface RobloxWindowInfo {
+  pid: number;
+  hwnd: string; // decimal string — avoids JS number precision issues with large HWNDs
+  title: string;
+}
+
+interface ScreenshotResult {
+  error?: string;
+  needsDisambiguation?: boolean;
+  windows?: RobloxWindowInfo[];
+  imageBase64?: string;
+}
+
+function enumRobloxWindows(): RobloxWindowInfo[] {
+  // PowerShell script that enumerates all visible windows whose owning process
+  // is a Roblox player executable, returning JSON [{pid, hwnd, title}, …].
+  const ps = `
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinEnum {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    public static List<object[]> GetVisibleWindows() {
+        var result = new List<object[]>();
+        EnumWindows((hWnd, _) => {
+            if (!IsWindowVisible(hWnd)) return true;
+            var sb = new StringBuilder(256);
+            GetWindowText(hWnd, sb, 256);
+            string title = sb.ToString();
+            if (string.IsNullOrEmpty(title)) return true;
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            result.Add(new object[] { pid, hWnd.ToString(), title });
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
+}
+"@
+
+$robloxPids = @(Get-Process -Name 'RobloxPlayerBeta' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+if ($robloxPids.Count -eq 0) {
+    Write-Output '[]'
+    exit
+}
+$allWindows = [WinEnum]::GetVisibleWindows()
+$found = @()
+foreach ($w in $allWindows) {
+    if ($robloxPids -contains [int]$w[0]) {
+        $found += [PSCustomObject]@{ pid=[int]$w[0]; hwnd=$w[1]; title=$w[2] }
+    }
+}
+if ($found.Count -eq 0) {
+    Write-Output '[]'
+} else {
+    $found | ConvertTo-Json -Compress
+}
+`;
+
+  const tmpFile = path.join(os.tmpdir(), `roblox_enum_${Date.now()}.ps1`);
+  try {
+    fs.writeFileSync(tmpFile, ps, "utf-8");
+    const raw = execSync(
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${tmpFile}"`,
+      { encoding: "utf-8", timeout: 15000, windowsHide: true }
+    ).trim();
+    if (!raw || raw === "" || raw === "null") return [];
+    const parsed = JSON.parse(raw);
+    // PowerShell returns a single object (not array) when there's exactly one result
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch (err: any) {
+    console.error("[Screenshot] enumRobloxWindows failed:", err.message);
+    return [];
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { }
+  }
+}
+
+function captureWindowPNG(hwnd: string): string {
+  // Returns base64-encoded PNG of the window contents.
+  // Uses PrintWindow with PW_RENDERFULLCONTENT (0x2) for best compatibility.
+  // Writes base64 to a temp output file to avoid stdout buffer limits (ENOBUFS).
+  const outFile = path.join(os.tmpdir(), `roblox_screenshot_${Date.now()}.b64`);
+  const ps = `
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinCapture {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hDC, uint nFlags);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+
+$hwnd = [IntPtr]::new([long]${hwnd})
+
+if ([WinCapture]::IsIconic($hwnd)) {
+    [WinCapture]::ShowWindow($hwnd, 9) | Out-Null  # SW_RESTORE
+    Start-Sleep -Milliseconds 200
+}
+
+$rect = New-Object WinCapture+RECT
+[WinCapture]::GetClientRect($hwnd, [ref]$rect) | Out-Null
+$w = $rect.Right - $rect.Left
+$h = $rect.Bottom - $rect.Top
+if ($w -le 0 -or $h -le 0) {
+    Write-Error "Window has zero size"
+    exit 1
+}
+
+$bmp = New-Object System.Drawing.Bitmap($w, $h)
+$gfx = [System.Drawing.Graphics]::FromImage($bmp)
+$hdc = $gfx.GetHdc()
+[WinCapture]::PrintWindow($hwnd, $hdc, 2) | Out-Null  # PW_RENDERFULLCONTENT
+$gfx.ReleaseHdc($hdc)
+$gfx.Dispose()
+
+$ms = New-Object System.IO.MemoryStream
+$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+$bytes = $ms.ToArray()
+$ms.Dispose()
+$b64 = [Convert]::ToBase64String($bytes)
+[System.IO.File]::WriteAllText('${outFile.replace(/\\/g, "\\\\")}', $b64)
+Write-Output 'OK'
+`;
+
+  const tmpFile = path.join(os.tmpdir(), `roblox_capture_${Date.now()}.ps1`);
+  try {
+    fs.writeFileSync(tmpFile, ps, "utf-8");
+    execSync(
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${tmpFile}"`,
+      { encoding: "utf-8", timeout: 15000, windowsHide: true }
+    );
+
+    if (!fs.existsSync(outFile)) throw new Error("PrintWindow did not produce output file");
+    const result = fs.readFileSync(outFile, "utf-8").trim();
+    if (!result) throw new Error("PrintWindow returned empty output");
+    return result;
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { }
+    try { fs.unlinkSync(outFile); } catch { }
+  }
+}
+
+function performScreenshot(pid?: number): ScreenshotResult {
+  const windows = enumRobloxWindows();
+
+  if (windows.length === 0) {
+    return { error: "No visible Roblox windows found. Make sure Roblox is running and not minimized." };
+  }
+
+  let targets = windows;
+  if (pid !== undefined) {
+    targets = windows.filter((w) => w.pid === pid);
+    if (targets.length === 0) {
+      return {
+        error: `No Roblox window found for PID ${pid}. Available windows:\n` +
+          windows.map((w) => `  PID ${w.pid} — "${w.title}"`).join("\n"),
+      };
+    }
+  }
+
+  if (targets.length > 1 && pid === undefined) {
+    return {
+      needsDisambiguation: true,
+      windows: targets,
+    };
+  }
+
+  // Capture the first (or only) matching window
+  const target = targets[0];
+  const imageBase64 = captureWindowPNG(target.hwnd);
+  return { imageBase64 };
+}
 
 // ─── Tool registrations (work in both primary & secondary mode) ─────────────────
 
@@ -2399,6 +2687,217 @@ server.registerTool(
     return {
       content: [{ type: "text", text: response.output }],
     };
+  }
+);
+
+server.registerTool(
+  "screenshot-window",
+  {
+    title: "Take a screenshot of a Roblox window",
+    description:
+      "Captures a screenshot of the Roblox game window using the Windows API (PrintWindow/GDI). " +
+      "Does NOT use any Lua/Roblox API — it captures the actual OS window contents. " +
+      "If multiple Roblox windows are open, specify the pid to target a specific one. " +
+      "Only works on Windows. " +
+      "If the MCP server is running as a secondary (with BASE_URL set), the screenshot request is relayed to the primary server — " +
+      "so the primary's machine (which may be a remote Windows host) performs the actual capture, even if roblox isn't running on the machine the MCP client is on.",
+    inputSchema: z.object({
+      pid: z
+        .number()
+        .describe(
+          "The PID (process ID) of the Roblox window to capture. If omitted and only one Roblox window exists, it is captured automatically. If multiple windows exist and no pid is provided, the tool returns a list of windows for disambiguation."
+        )
+        .optional(),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ pid, clientId }) => {
+    // ── Secondary mode: relay to primary via HTTP ──
+    // Do this BEFORE the platform guard — a non-Windows secondary can still
+    // forward to a Windows primary that does the actual capture.
+    if (instanceRole === "secondary" && BASE_URL) {
+      try {
+        const targetUrl = BASE_URL.replace(/\/$/, "") + "/api/screenshot";
+        const body = JSON.stringify({ pid });
+        const resp = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+        const result: ScreenshotResult = await resp.json() as ScreenshotResult;
+
+        if (result.error) {
+          return {
+            content: [{ type: "text" as const, text: result.error }],
+            isError: true,
+          };
+        }
+
+        if (result.needsDisambiguation && result.windows) {
+          const listing = result.windows
+            .map((w) => `  • PID ${w.pid} — "${w.title}"`)
+            .join("\n");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  "Multiple Roblox windows were found. Please re-call this tool with the `pid` parameter set to the correct process:\n\n" +
+                  listing,
+              },
+            ],
+          };
+        }
+
+        if (result.imageBase64) {
+          return {
+            content: [
+              {
+                type: "image" as const,
+                data: result.imageBase64,
+                mimeType: "image/png",
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: "Screenshot failed: unexpected response from primary." }],
+          isError: true,
+        };
+      } catch (err: any) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Failed to relay screenshot to primary: ${err.message || err}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    // ── Primary mode: capture locally ──
+    // If we're here without a BASE_URL relay, the platform must be Windows.
+    if (process.platform !== "win32") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Error: The screenshot-window tool is only available on Windows. The current platform is: " + process.platform,
+          },
+        ],
+        isError: true,
+      };
+    }
+    try {
+      const result = performScreenshot(pid);
+
+      if (result.error) {
+        return {
+          content: [{ type: "text" as const, text: result.error }],
+          isError: true,
+        };
+      }
+
+      if (result.needsDisambiguation && result.windows) {
+        const listing = result.windows
+          .map((w) => `  • PID ${w.pid} — "${w.title}"`)
+          .join("\n");
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "Multiple Roblox windows were found. Please re-call this tool with the `pid` parameter set to the correct process:\n\n" +
+                listing,
+            },
+          ],
+        };
+      }
+
+      if (result.imageBase64) {
+        return {
+          content: [
+            {
+              type: "image" as const,
+              data: result.imageBase64,
+              mimeType: "image/png",
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: "Screenshot failed: unexpected result." }],
+        isError: true,
+      };
+    } catch (err: any) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Screenshot failed: ${err.message || err}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "list-roblox-windows",
+  {
+    title: "List visible Roblox windows",
+    description:
+      "Returns all visible Roblox game windows and their PIDs. Useful for disambiguating which PID to pass to the screenshot-window tool when multiple instances of Roblox are running. " +
+      "If the MCP server is running as a secondary (with BASE_URL set), the request is relayed to the primary server.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    // ── Secondary mode: relay to primary via HTTP ──
+    if (instanceRole === "secondary" && BASE_URL) {
+      try {
+        const targetUrl = BASE_URL.replace(/\/$/, "") + "/api/windows";
+        const resp = await fetch(targetUrl);
+        const result = await resp.json() as { windows?: RobloxWindowInfo[]; error?: string };
+
+        if (result.error) {
+          return { content: [{ type: "text" as const, text: result.error }], isError: true };
+        }
+
+        const wins = result.windows ?? [];
+        if (wins.length === 0) {
+          return { content: [{ type: "text" as const, text: "No visible Roblox windows found on the primary host." }] };
+        }
+
+        const listing = wins.map((w) => `PID ${w.pid} — "${w.title}"`).join("\n");
+        return { content: [{ type: "text" as const, text: listing }] };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: `Failed to relay to primary: ${err.message || err}` }],
+          isError: true,
+        };
+      }
+    }
+
+    // ── Primary mode ──
+    if (process.platform !== "win32") {
+      return {
+        content: [{ type: "text" as const, text: "Window enumeration is only supported on Windows. Current platform: " + process.platform }],
+        isError: true,
+      };
+    }
+
+    const wins = enumRobloxWindows();
+    if (wins.length === 0) {
+      return { content: [{ type: "text" as const, text: "No visible Roblox windows found." }] };
+    }
+
+    const listing = wins.map((w) => `PID ${w.pid} — "${w.title}"`).join("\n");
+    return { content: [{ type: "text" as const, text: listing }] };
   }
 );
 
