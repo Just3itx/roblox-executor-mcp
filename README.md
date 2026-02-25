@@ -9,6 +9,7 @@ An MCP server that bridges LLMs and a running Roblox Game Client — execute cod
 - **Instance Search** — CSS-like selectors via `QueryDescendants` and hierarchy trees.
 - **Remote Spy** — [Cobalt](https://github.com/notpoiu/cobalt) integration to intercept, log, block, and ignore Remotes/Bindables.
 - **Multi-Client** — Connect multiple Roblox clients simultaneously; target each by `clientId`. Dashboard at `http://localhost:16384/`.
+- **Screenshot** — Take screenshots of Roblox windows (Windows only).
 - **Primary / Secondary** — Multiple MCP instances auto-coordinate; secondaries relay through the primary with automatic promotion.
 
 ## Prerequisites
