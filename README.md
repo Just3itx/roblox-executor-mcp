@@ -67,6 +67,8 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/notpoiu/roblox-execut
 | | `clear-remote-spy-logs` | Clear all logs |
 | | `block-remote` | Block/unblock a remote |
 | | `ignore-remote` | Ignore/unignore a remote |
+| ** GUI Interactions |`click-button` | Simulate a button click on a Textbutton/ImageButtton |
+| | `type-text-box` | Interact with a textbox |
 
 ## Security Note
 
