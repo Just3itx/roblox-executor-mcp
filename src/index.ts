@@ -1266,6 +1266,24 @@ function startAsPrimary(): Promise<void> {
           return;
         }
 
+        // ── Windows list API (used by secondary relay) ──
+        if (url.pathname === "/api/windows" && req.method === "GET") {
+          try {
+            if (process.platform !== "win32") {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Window enumeration is only supported on Windows." }));
+              return;
+            }
+            const windows = enumRobloxWindows();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ windows }));
+          } catch (err: any) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `Window enumeration failed: ${err.message || err}` }));
+          }
+          return;
+        }
+
         res.writeHead(200);
         res.end("MCP Server Running");
       }
@@ -2694,20 +2712,9 @@ server.registerTool(
     }),
   },
   async ({ pid, clientId }) => {
-    // ── Non-Windows guard ──
-    if (process.platform !== "win32") {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "Error: The screenshot-window tool is only available on Windows. The current platform is: " + process.platform,
-          },
-        ],
-        isError: true,
-      };
-    }
-
     // ── Secondary mode: relay to primary via HTTP ──
+    // Do this BEFORE the platform guard — a non-Windows secondary can still
+    // forward to a Windows primary that does the actual capture.
     if (instanceRole === "secondary" && BASE_URL) {
       try {
         const targetUrl = BASE_URL.replace(/\/$/, "") + "/api/screenshot";
@@ -2772,6 +2779,18 @@ server.registerTool(
     }
 
     // ── Primary mode: capture locally ──
+    // If we're here without a BASE_URL relay, the platform must be Windows.
+    if (process.platform !== "win32") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Error: The screenshot-window tool is only available on Windows. The current platform is: " + process.platform,
+          },
+        ],
+        isError: true,
+      };
+    }
     try {
       const result = performScreenshot(pid);
 
@@ -2825,6 +2844,60 @@ server.registerTool(
         isError: true,
       };
     }
+  }
+);
+
+server.registerTool(
+  "list-roblox-windows",
+  {
+    title: "List visible Roblox windows",
+    description:
+      "Returns all visible Roblox game windows and their PIDs. Useful for disambiguating which PID to pass to the screenshot-window tool when multiple instances of Roblox are running. " +
+      "If the MCP server is running as a secondary (with BASE_URL set), the request is relayed to the primary server.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    // ── Secondary mode: relay to primary via HTTP ──
+    if (instanceRole === "secondary" && BASE_URL) {
+      try {
+        const targetUrl = BASE_URL.replace(/\/$/, "") + "/api/windows";
+        const resp = await fetch(targetUrl);
+        const result = await resp.json() as { windows?: RobloxWindowInfo[]; error?: string };
+
+        if (result.error) {
+          return { content: [{ type: "text" as const, text: result.error }], isError: true };
+        }
+
+        const wins = result.windows ?? [];
+        if (wins.length === 0) {
+          return { content: [{ type: "text" as const, text: "No visible Roblox windows found on the primary host." }] };
+        }
+
+        const listing = wins.map((w) => `PID ${w.pid} — "${w.title}"`).join("\n");
+        return { content: [{ type: "text" as const, text: listing }] };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: `Failed to relay to primary: ${err.message || err}` }],
+          isError: true,
+        };
+      }
+    }
+
+    // ── Primary mode ──
+    if (process.platform !== "win32") {
+      return {
+        content: [{ type: "text" as const, text: "Window enumeration is only supported on Windows. Current platform: " + process.platform }],
+        isError: true,
+      };
+    }
+
+    const wins = enumRobloxWindows();
+    if (wins.length === 0) {
+      return { content: [{ type: "text" as const, text: "No visible Roblox windows found." }] };
+    }
+
+    const listing = wins.map((w) => `PID ${w.pid} — "${w.title}"`).join("\n");
+    return { content: [{ type: "text" as const, text: listing }] };
   }
 );
 
